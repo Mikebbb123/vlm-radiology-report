@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/27684410/README.md)
 # An Empirical Study of VLM Fine-tuning for Radiology Report Generation
 ### Why Retrieval Baselines Win on Small-Scale Medical Benchmarks
 
@@ -110,38 +109,59 @@ The primary gap vs. LLaVA-Med: they pre-train on 213K MIMIC-CXR samples; we use 
 
 ## Repository Structure
 
+Each method is organized as a self-contained directory with its own training, evaluation, and utility scripts.
+
 ```
 .
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
+├── main_results.csv             # Full results table (all methods)
 │
-├── data/
-│   ├── README.md               # Dataset download instructions
-│   └── preprocess.py           # Data preprocessing and R2Gen split
+├── disease_hint/                # Experiment 1: Disease-hint guided prompting
+│   ├── config.py
+│   ├── data_utils.py
+│   ├── disease_classifier.py
+│   ├── model.py
+│   ├── train.py
+│   ├── evaluate.py
+│   └── oracle_eval.py
 │
-├── models/
-│   ├── densenet_classifier.py  # DenseNet-121 disease classifier
-│   └── vff_module.py           # Gated cross-attention VFF module
+├── cat/                         # Experiment 2: Classifier-Aligned Training
+│   ├── config.py
+│   ├── data_utils.py
+│   ├── disease_classifier.py
+│   ├── finetune_classifier.py
+│   ├── model.py
+│   ├── train.py
+│   ├── evaluate.py
+│   ├── precompute_classifier_hints.py
+│   └── oracle_eval.py
 │
-├── experiments/
-│   ├── baseline_lora.py        # Experiment 1: LoRA baseline
-│   ├── disease_hint.py         # Experiment 2: Disease-hint prompting
-│   ├── cat_training.py         # Experiment 3: Classifier-Aligned Training
-│   ├── vff_training.py         # Experiment 4: Visual Feature Fusion
-│   ├── mimic_pretrain.py       # Experiment 5: MIMIC text pre-training
-│   └── nn_retrieval.py         # Experiment 6: NN retrieval baseline
+├── vff/                         # Experiment 3: Visual Feature Fusion
+│   ├── data_utils.py
+│   ├── visual_feature_fusion.py # Gated cross-attention module
+│   ├── train.py
+│   ├── evaluate.py
+│   ├── precompute_densenet_features.py
+│   ├── retrieval_eval.py
+│   └── smoke_test_vff.py
 │
-├── evaluation/
-│   ├── compute_nlg.py          # BLEU, ROUGE-L, METEOR
-│   └── compute_clinical.py     # CheXbert-5/14, RadGraph
+├── mic/                         # Experiment 4: MIMIC-CXR text pre-training
+│   ├── config.py
+│   ├── data_utils.py
+│   ├── disease_classifier.py
+│   ├── mimic_pretrain.py        # Pre-training on 148K MIMIC-CXR reports
+│   ├── model.py
+│   ├── train.py
+│   ├── evaluate.py
+│   └── oracle_eval.py
 │
-├── results/
-│   ├── main_results.csv        # Full results table
-│   └── predictions/            # Model outputs per experiment
+├── nn/                          # Experiment 5: NN retrieval baseline
+│   └── NN.py                    # Zero-training retrieval (~30 seconds)
 │
-└── docs/
-    └── technical_report.pdf    # Full technical report
+└── data/
+    └── README.md                # Dataset download instructions
 ```
 
 ---
@@ -198,48 +218,51 @@ classifier = xrv.models.DenseNet(weights="densenet121-res224-all")
 
 ## Reproducing Results
 
-### Experiment 1: LoRA Baseline
+### Experiment 1: Disease-Hint Guided Prompting
 
 ```bash
-python experiments/baseline_lora.py \
-  --data_dir ./data \
-  --output_dir ./checkpoints/baseline \
-  --base_model Qwen/Qwen2-VL-7B-Instruct \
-  --lora_rank 16 \
-  --lora_alpha 32 \
-  --epochs 10 \
-  --batch_size 4
+cd disease_hint
+python train.py
+python evaluate.py
 ```
 
-Expected: BLEU-4 ≈ 8.71, ROUGE-L ≈ 30.41
-
-### Experiment 2: NN Retrieval (Zero Training, ~30 seconds)
+### Experiment 2: CAT (Classifier-Aligned Training)
 
 ```bash
-python experiments/nn_retrieval.py \
-  --data_dir ./data \
-  --output_file ./results/nn_retrieval_predictions.json
+cd cat
+python finetune_classifier.py         # Step 1: fine-tune DenseNet classifier
+python precompute_classifier_hints.py # Step 2: precompute hints
+python train.py                       # Step 3: train with aligned hints
+python evaluate.py
+```
+
+### Experiment 3: VFF (Visual Feature Fusion)
+
+```bash
+cd vff
+python precompute_densenet_features.py  # Step 1: precompute DenseNet features
+python smoke_test_vff.py                # Step 2: verify VFF module
+python train.py                         # Step 3: train with visual fusion
+python evaluate.py
+```
+
+### Experiment 4: MIMIC-CXR Text Pre-training
+
+```bash
+cd mic
+python mimic_pretrain.py   # Step 1: pre-train on 148K MIMIC-CXR reports
+python train.py            # Step 2: fine-tune on IU-Xray
+python evaluate.py
+```
+
+### Experiment 5: NN Retrieval (Zero Training, ~30 seconds)
+
+```bash
+cd nn
+python NN.py
 ```
 
 Expected: BLEU-4 ≈ 9.08 — **no training required**
-
-### Experiments 3–5
-
-See individual scripts in `experiments/` for CAT, VFF, and MIMIC pre-training configurations.
-
-### Evaluation
-
-```bash
-# NLG metrics (BLEU, ROUGE, METEOR)
-python evaluation/compute_nlg.py \
-  --predictions ./results/predictions.json \
-  --references ./data/test_references.json
-
-# Clinical metrics (CheXbert, RadGraph)
-python evaluation/compute_clinical.py \
-  --predictions ./results/predictions.json \
-  --references ./data/test_references.json
-```
 
 ---
 
