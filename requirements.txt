@@ -1,0 +1,46 @@
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# transformers MUST be 4.x — radgraph's bundled allennlp calls
+# tokenizer.encode_plus() which was removed in transformers 5.x
+transformers>=4.30,<5.0
+tokenizers<0.20
+
+peft>=0.12.0
+accelerate>=0.26.0
+
+# Qwen2-VL specific
+qwen-vl-utils
+
+# Medical imaging
+torchxrayvision
+
+# Image processing
+opencv-python>=4.7.0
+Pillow>=9.0.0
+
+# NLG evaluation
+evaluate>=0.4.0
+nltk>=3.8.0
+rouge-score>=0.1.2
+
+# Clinical evaluation
+# NOTE: f1chexbert does NOT auto-download the CheXbert checkpoint.
+# After installing, manually download chexbert.pth and place at:
+#   ~/.cache/chexbert/chexbert.pth
+# Sources:
+#   Kaggle:  https://www.kaggle.com/datasets/positivecoder/chexbert-model-pth-file
+#   Box:     https://stanfordmedicine.box.com/s/c3stck6w6dol3h36grdc97xoydzxd7w9
+f1chexbert
+# NOTE: RadGraph model (~400MB) auto-downloads from HuggingFace on first call.
+radgraph
+appdirs
+
+# Data processing
+numpy>=1.24.0
+pandas>=1.5.0
+scikit-learn>=1.2.0
+
+# Utilities
+tqdm>=4.65.0
