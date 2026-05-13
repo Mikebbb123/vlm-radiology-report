@@ -1,0 +1,8 @@
+Method,Type,BLEU-1,BLEU-2,BLEU-3,BLEU-4,ROUGE-1,ROUGE-2,ROUGE-L,METEOR,Unique_Outputs,CheXbert5_micro_F1,CheXbert5_macro_F1,CheXbert14_micro_F1,CheXbert14_macro_F1,RadGraph_Simple,RadGraph_Partial
+LoRA Baseline,Fine-tuning,29.97,17.71,11.85,8.48,41.26,15.24,30.41,23.95,30,0.00,0.00,51.63,5.26,35.75,33.15
+Disease-Hint (main),Fine-tuning,—,—,—,~9.0,—,—,—,—,—,—,—,—,—,—,—
+CAT,Fine-tuning,22.14,13.27,9.20,6.63,36.84,14.31,27.50,20.19,29,3.10,1.19,53.66,5.39,34.37,32.87
+VFF,Fine-tuning,27.06,16.54,11.47,8.39,40.15,16.04,29.81,23.23,43,0.00,0.00,54.17,5.02,37.11,34.36
+MIMIC Pre-training,Fine-tuning,22.46,13.60,9.38,6.80,34.27,13.63,27.15,20.02,17,10.84,2.67,36.35,4.95,32.57,30.79
+NN Retrieval (zero training),Retrieval,29.83,18.11,12.38,9.08,37.90,14.82,27.62,—,—,25.33,17.73,41.45,15.47,33.06,30.29
+Oracle (GT leak),Reference,37.54,25.83,19.86,16.14,47.47,22.80,35.87,32.28,—,23.78,11.11,54.51,12.77,43.08,40.19
