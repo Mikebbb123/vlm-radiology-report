@@ -1,0 +1,422 @@
+"""
+Disease-Aware VLM 评估
+
+Usage:
+    python evaluate.py                          # 自动用 CheXNet 疾病引导
+    python evaluate.py --no_disease             # 纯 baseline (无引导)
+    python evaluate.py --ablation               # 消融实验 (4组对比)
+    python evaluate.py --max_samples 50         # 快速测试
+    python evaluate.py --threshold 0.3          # 调整疾病预测阈值
+"""
+import os
+import json
+import random
+import argparse
+import torch
+import numpy as np
+from typing import Dict, List
+from tqdm import tqdm
+
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from peft import PeftModel
+from qwen_vl_utils import process_vision_info
+
+from config import TrainingConfig, DataConfig, GenerationConfig
+from data_utils import (
+    load_r2gen_data, clean_report_text,
+    SYSTEM_PROMPT, USER_PROMPT_BASIC,
+)
+
+
+def set_seed(seed: int = 42):
+    """固定随机种子，保证 sampling 评估可复现"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+# ============================================================
+# 1. 指标
+# ============================================================
+
+def compute_bleu(refs, hyps):
+    from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+    r = [[ref.split()] for ref in refs]
+    h = [hyp.split() for hyp in hyps]
+    smooth = SmoothingFunction().method1
+    scores = {}
+    for n in range(1, 5):
+        w = tuple([1.0/n]*n + [0.0]*(4-n))
+        try: scores[f"BLEU-{n}"] = round(corpus_bleu(r, h, weights=w, smoothing_function=smooth)*100, 2)
+        except: scores[f"BLEU-{n}"] = 0.0
+    return scores
+
+def compute_rouge(refs, hyps):
+    from rouge_score import rouge_scorer
+    scorer = rouge_scorer.RougeScorer(['rouge1','rouge2','rougeL'], use_stemmer=True)
+    s = {"ROUGE-1":[],"ROUGE-2":[],"ROUGE-L":[]}
+    for ref, hyp in zip(refs, hyps):
+        r = scorer.score(ref, hyp)
+        s["ROUGE-1"].append(r["rouge1"].fmeasure)
+        s["ROUGE-2"].append(r["rouge2"].fmeasure)
+        s["ROUGE-L"].append(r["rougeL"].fmeasure)
+    return {k: round(np.mean(v)*100, 2) for k,v in s.items()}
+
+def compute_meteor(refs, hyps):
+    try:
+        from nltk.translate.meteor_score import meteor_score as ms
+        import nltk
+        nltk.download('wordnet', quiet=True)
+        nltk.download('omw-1.4', quiet=True)
+        scores = [ms([r.split()], h.split()) for r,h in zip(refs, hyps)]
+        return {"METEOR": round(np.mean(scores)*100, 2)}
+    except: return {"METEOR": 0.0}
+
+def compute_all_metrics(refs, hyps):
+    m = {}
+    m.update(compute_bleu(refs, hyps))
+    m.update(compute_rouge(refs, hyps))
+    m.update(compute_meteor(refs, hyps))
+    return m
+
+
+# ============================================================
+# 2. 模型加载
+# ============================================================
+
+def load_model(model_path, train_config):
+    print(f"[Eval] Loading VLM + LoRA from {model_path}...")
+    base = Qwen2VLForConditionalGeneration.from_pretrained(
+        train_config.model_name, device_map="auto",
+        torch_dtype=torch.bfloat16, trust_remote_code=True,
+    )
+    processor = AutoProcessor.from_pretrained(
+        train_config.model_name, trust_remote_code=True,
+        min_pixels=train_config.image_min_pixels,
+        max_pixels=train_config.image_max_pixels,
+    )
+    model = PeftModel.from_pretrained(base, model_path, is_trainable=False)
+    model.eval()
+    return model, processor
+
+
+def load_disease_classifier(device):
+    """加载 torchxrayvision 预训练分类器"""
+    try:
+        from disease_classifier import DiseaseClassifier
+        return DiseaseClassifier(device=str(device))
+    except ImportError:
+        print("[Eval] ⚠️ torchxrayvision not installed. Run: pip install torchxrayvision")
+        print("[Eval] Falling back to baseline (no disease guidance)")
+        return None
+    except Exception as e:
+        print(f"[Eval] ⚠️ Failed to load disease classifier: {e}")
+        return None
+
+
+# ============================================================
+# 3. 生成
+# ============================================================
+
+def build_dual_view_messages(frontal_path, lateral_path, user_text):
+    return [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+        {"role": "user", "content": [
+            {"type": "image", "image": f"file://{frontal_path}"},
+            {"type": "image", "image": f"file://{lateral_path}"},
+            {"type": "text", "text": user_text},
+        ]},
+    ]
+
+
+def generate_single(
+    model, processor, frontal_path, lateral_path,
+    gen_kwargs, disease_classifier=None, threshold=0.5,
+):
+    user_text = USER_PROMPT_BASIC
+
+    # CheXNet 疾病引导
+    if disease_classifier is not None:
+        hint = disease_classifier.get_prompt_hint(
+            frontal_path, lateral_path, threshold=threshold
+        )
+        user_text = USER_PROMPT_BASIC + " " + hint
+
+    messages = build_dual_view_messages(frontal_path, lateral_path, user_text)
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, _ = process_vision_info(messages)
+    inputs = processor(text=[text], images=image_inputs, return_tensors="pt", padding=True)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    input_len = inputs["input_ids"].shape[1]
+
+    with torch.no_grad():
+        out = model.generate(**inputs, **gen_kwargs)
+
+    return processor.decode(out[0][input_len:], skip_special_tokens=True)
+
+
+def generate_reports(
+    model, processor, test_data, images_dir, gen_config,
+    disease_classifier=None, threshold=0.5, max_samples=None,
+):
+    # 根据 do_sample 分支构造 kwargs——sampling 和 beam 的参数集不兼容，分开走更干净
+    if gen_config.do_sample:
+        gen_kwargs = {
+            "do_sample": True,
+            "top_p": gen_config.top_p,
+            "temperature": gen_config.temperature,
+            "repetition_penalty": gen_config.repetition_penalty,
+            "no_repeat_ngram_size": gen_config.no_repeat_ngram_size,
+            "max_new_tokens": gen_config.max_new_tokens,
+            "min_new_tokens": gen_config.min_new_tokens,
+        }
+    else:
+        gen_kwargs = {
+            "do_sample": False,
+            "num_beams": gen_config.num_beams,
+            "length_penalty": gen_config.length_penalty,
+            "repetition_penalty": gen_config.repetition_penalty,
+            "no_repeat_ngram_size": gen_config.no_repeat_ngram_size,
+            "early_stopping": gen_config.early_stopping,
+            "max_new_tokens": gen_config.max_new_tokens,
+            "min_new_tokens": gen_config.min_new_tokens,
+        }
+
+    ids, refs, hyps = [], [], []
+    samples = test_data[:max_samples] if max_samples else test_data
+    skipped = 0
+    errors = 0
+
+    for item in tqdm(samples, desc="Generating"):
+        report = clean_report_text(item.get("report", ""))
+        img_paths = item.get("image_path", [])
+        sample_id = item.get("id", "")
+
+        if len(report) < 15 or len(img_paths) < 2:
+            skipped += 1
+            continue
+
+        frontal = os.path.join(images_dir, img_paths[0])
+        lateral = os.path.join(images_dir, img_paths[1])
+
+        if not os.path.exists(frontal) or not os.path.exists(lateral):
+            skipped += 1
+            continue
+
+        try:
+            hyp = generate_single(
+                model, processor, frontal, lateral, gen_kwargs,
+                disease_classifier=disease_classifier, threshold=threshold,
+            )
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print(f"[Eval] OOM on {sample_id}, skipping")
+            errors += 1
+            continue
+        except Exception as e:
+            print(f"[Eval] Error on {sample_id}: {type(e).__name__}: {e}")
+            errors += 1
+            continue
+
+        ids.append(sample_id)
+        refs.append(report)
+        hyps.append(clean_report_text(hyp))
+
+    if skipped > 0:
+        print(f"[Eval] Skipped (missing data): {skipped}")
+    if errors > 0:
+        print(f"[Eval] Errors (excluded from metrics): {errors}")
+
+    return ids, refs, hyps
+
+
+# ============================================================
+# 4. 消融实验
+# ============================================================
+
+def run_ablation(model, processor, test_data, images_dir, device, disease_classifier=None):
+    """
+    消融实验 (4 组)——核心是验证"旧 beam4 配置是否为输出雷同的主因"：
+    1. Sampling (top_p=0.9, T=0.7)      : 新默认配置
+    2. Sampling + Disease (threshold=0.3): 采样 + 更低疾病阈值
+    3. Beam4 (OLD config)                : 复现 baseline 结果的旧配置
+    4. Greedy                             : 无采样无 beam 基线
+    """
+    results = {}
+    max_samples = min(200, len(test_data))
+
+    # 每组配置的 overrides 会直接覆盖 GenerationConfig 默认值
+    configs = [
+        ("Sampling (top_p=0.9)", disease_classifier, 0.5, {
+            "do_sample": True, "num_beams": 1,
+            "top_p": 0.9, "temperature": 0.7,
+            "repetition_penalty": 1.05, "no_repeat_ngram_size": 0,
+        }),
+        ("Sampling + Disease (t=0.3)", disease_classifier, 0.3, {
+            "do_sample": True, "num_beams": 1,
+            "top_p": 0.9, "temperature": 0.7,
+            "repetition_penalty": 1.05, "no_repeat_ngram_size": 0,
+        }),
+        ("Beam4 (OLD)", None, 0.5, {
+            "do_sample": False, "num_beams": 4,
+            "length_penalty": 1.2, "repetition_penalty": 1.2,
+            "no_repeat_ngram_size": 3, "early_stopping": True,
+        }),
+        ("Greedy", None, 0.5, {
+            "do_sample": False, "num_beams": 1,
+            "repetition_penalty": 1.05, "no_repeat_ngram_size": 0,
+        }),
+    ]
+
+    for i, (name, dc, thresh, overrides) in enumerate(configs):
+        if dc is None and "Disease" in name:
+            continue
+        print(f"\n[Ablation {i+1}/{len(configs)}] {name}")
+
+        # 每组实验前重置 seed，保证 sampling 组可复现
+        set_seed(42)
+
+        gen_config = GenerationConfig()
+        for k, v in overrides.items():
+            setattr(gen_config, k, v)
+
+        _, r, h = generate_reports(
+            model, processor, test_data, images_dir, gen_config,
+            disease_classifier=dc, threshold=thresh,
+            max_samples=max_samples,
+        )
+        results[name] = compute_all_metrics(r, h)
+
+    return results
+
+
+# ============================================================
+# 5. 主函数
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str,
+                        default="/content/drive/MyDrive/medk_lora_r2gen/lora_discourse")
+    parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Disease prediction threshold")
+    parser.add_argument("--ablation", action="store_true")
+    parser.add_argument("--no_disease", action="store_true",
+                        help="Disable CheXNet disease guidance")
+    parser.add_argument("--output_file", type=str, default="eval_results.json")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducible sampling")
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+
+    try:
+        import nltk
+        nltk.download('punkt', quiet=True)
+        nltk.download('punkt_tab', quiet=True)
+        nltk.download('wordnet', quiet=True)
+        nltk.download('omw-1.4', quiet=True)
+    except: pass
+
+    train_config = TrainingConfig()
+    data_config = DataConfig()
+
+    _, _, test_data = load_r2gen_data(data_config)
+    print(f"[Eval] Test: {len(test_data)} (R2Gen standard split)")
+
+    model, processor = load_model(args.model_path, train_config)
+    device = next(model.parameters()).device
+
+    # 加载 CheXNet 疾病分类器
+    disease_classifier = None
+    if not args.no_disease:
+        disease_classifier = load_disease_classifier(device)
+
+    mode = f"Disease-Guided (CheXNet, threshold={args.threshold})" if disease_classifier else "Baseline"
+    print(f"\n[Eval] Mode: {mode}")
+
+    gen_config = GenerationConfig()
+    if gen_config.do_sample:
+        print(f"[Eval] Config: sampling (top_p={gen_config.top_p}, T={gen_config.temperature}), "
+              f"rep_penalty={gen_config.repetition_penalty}, no_repeat_ngram={gen_config.no_repeat_ngram_size}, "
+              f"max_tokens={gen_config.max_new_tokens}")
+    else:
+        print(f"[Eval] Config: beam={gen_config.num_beams}, "
+              f"length_penalty={gen_config.length_penalty}, "
+              f"max_tokens={gen_config.max_new_tokens}")
+
+    # 主评估
+    sample_ids, refs, hyps = generate_reports(
+        model, processor, test_data, data_config.images_dir, gen_config,
+        disease_classifier=disease_classifier, threshold=args.threshold,
+        max_samples=args.max_samples,
+    )
+
+    metrics = compute_all_metrics(refs, hyps)
+
+    ref_len = np.mean([len(r.split()) for r in refs])
+    hyp_len = np.mean([len(h.split()) for h in hyps])
+
+    print(f"\n{'='*70}")
+    print(f" EVALUATION RESULTS ({len(refs)} samples)")
+    print(f" Data: R2Gen standard test split")
+    print(f" Mode: {mode}")
+    print(f"{'='*70}")
+    for m, s in sorted(metrics.items()):
+        print(f"  {m:<15} {s:>10.2f}")
+    print(f"\n  Ref length: {ref_len:.1f} | Gen length: {hyp_len:.1f}")
+
+    examples = []
+    for i in range(min(5, len(refs))):
+        examples.append({"id": sample_ids[i], "reference": refs[i], "generated": hyps[i]})
+        print(f"\n--- {sample_ids[i]} ---")
+        print(f"  Ref: {refs[i][:120]}")
+        print(f"  Gen: {hyps[i][:120]}")
+
+    # 消融实验
+    ablation = {}
+    if args.ablation:
+        ablation = run_ablation(
+            model, processor, test_data, data_config.images_dir, device,
+            disease_classifier=disease_classifier,
+        )
+        print(f"\n{'='*70}")
+        print(f" ABLATION RESULTS")
+        print(f"{'='*70}")
+        header = f"  {'Method':<30}"
+        for m in ["BLEU-4", "ROUGE-L", "METEOR"]:
+            header += f" {m:>10}"
+        print(header)
+        print(f"  {'-'*60}")
+        for method, scores in ablation.items():
+            row = f"  {method:<30}"
+            for m in ["BLEU-4", "ROUGE-L", "METEOR"]:
+                row += f" {scores.get(m,0):>10.2f}"
+            print(row)
+
+    # 保存
+    output = {
+        "metrics": metrics,
+        "mode": mode,
+        "data_split": "R2Gen standard",
+        "ablation": ablation,
+        "examples": examples,
+        "config": {
+            "model_path": args.model_path,
+            "model_name": train_config.model_name,
+            "num_samples": len(refs),
+            "generation_config": vars(gen_config),
+            "disease_threshold": args.threshold if disease_classifier else None,
+            "ref_avg_length": round(ref_len, 1),
+            "hyp_avg_length": round(hyp_len, 1),
+        }
+    }
+    with open(args.output_file, "w") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+    print(f"\n[Eval] Saved to {args.output_file}")
+
+
+if __name__ == "__main__":
+    main()
