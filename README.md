@@ -14,7 +14,7 @@
 **Institution:** College of Science, Mathematics and Technology, Wenzhou-Kean University  
 **Year:** 2025
 
-> 📄 [Technical Report (Zenodo)](https://doi.org/10.5281/zenodo.20151108) · 🤗 [Base Model (Qwen2-VL-7B)](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct)
+> 📄 [Technical Report - Full (Zenodo)](https://doi.org/10.5281/zenodo.20151108) · [GitHub Mirror](https://github.com/Mikebbb123/vlm-radiology-report/blob/main/technical_report_long.pdf) · 📄 [Technical Report - Short (Zenodo)](https://doi.org/10.5281/zenodo.20151108) · [GitHub Mirror](https://github.com/Mikebbb123/vlm-radiology-report/blob/main/technical_report_short.pdf) · 🤗 [Base Model (Qwen2-VL-7B)](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct)
 
 ---
 
