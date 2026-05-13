@@ -14,7 +14,7 @@
 **Institution:** College of Science, Mathematics and Technology, Wenzhou-Kean University  
 **Year:** 2025
 
-> 📄 [Technical Report (Zenodo)](YOUR_ZENODO_LINK) · 📄 [arXiv](YOUR_ARXIV_LINK) · 🤗 [Base Model (Qwen2-VL-7B)](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct)
+> 📄 [Technical Report (Zenodo)](https://doi.org/10.5281/zenodo.20151108) · 🤗 [Base Model (Qwen2-VL-7B)](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct)
 
 ---
 
@@ -116,7 +116,10 @@ Each method is organized as a self-contained directory with its own training, ev
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
+├── LICENSE
 ├── main_results.csv             # Full results table (all methods)
+├── clinical_metrics.py          # CheXbert-5/14 + RadGraph-F1 evaluation
+├── evaluate.py                  # NLG metrics (BLEU, ROUGE-L, METEOR)
 │
 ├── disease_hint/                # Experiment 1: Disease-hint guided prompting
 │   ├── config.py
@@ -157,11 +160,8 @@ Each method is organized as a self-contained directory with its own training, ev
 │   ├── evaluate.py
 │   └── oracle_eval.py
 │
-├── nn/                          # Experiment 5: NN retrieval baseline
-│   └── NN.py                    # Zero-training retrieval (~30 seconds)
-│
-└── data/
-    └── README.md                # Dataset download instructions
+└── nn/                          # Experiment 5: NN retrieval baseline
+    └── NN.py                    # Zero-training retrieval (~30 seconds)
 ```
 
 ---
@@ -264,9 +264,23 @@ python NN.py
 
 Expected: BLEU-4 ≈ 9.08 — **no training required**
 
----
+### Evaluation
 
-## LoRA Configuration
+**NLG metrics (BLEU, ROUGE-L, METEOR):**
+```bash
+python evaluate.py --predictions ./results/predictions.json \
+                   --references ./results/references.json
+```
+
+**Clinical metrics (CheXbert-5/14, RadGraph-F1):**
+```bash
+# See clinical_metrics.py for one-time setup instructions
+# (CheXbert checkpoint must be manually downloaded)
+python clinical_metrics.py --input predictions.json \
+                            --output clinical_scores.json
+```
+
+---
 
 ```python
 from peft import LoraConfig
@@ -308,7 +322,7 @@ If you find this work useful, please cite:
   author    = {Shen, Zhengbo and Lai, Bangheng},
   institution = {Wenzhou-Kean University},
   year      = {2025},
-  url       = {YOUR_ZENODO_OR_ARXIV_LINK}
+  url       = {https://doi.org/10.5281/zenodo.20151108}
 }
 
 @inproceedings{chen2020generating,
